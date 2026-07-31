@@ -3298,6 +3298,14 @@ pub(super) async fn process_message_streaming_mpsc(
             "Turn-end gate followup loop exceeded {MAX_FOLLOWUP_TURNS} turns for session {session_id}; stopping continuation"
         ));
     }
+    // The final iteration's gate may have queued another followup that the loop
+    // cap (or a failed final turn) prevented us from consuming. Drop it so a
+    // stale orchestrator instruction never leaks into the next user turn.
+    if agent.take_pending_followup().is_some() {
+        crate::logging::warn(&format!(
+            "Dropped stale turn-end gate followup for session {session_id} after loop exit"
+        ));
+    }
 
     if result.is_ok() {
         crate::runtime_memory_log::emit_event(
