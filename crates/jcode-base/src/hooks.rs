@@ -44,6 +44,17 @@ pub enum GateDecision {
     Block { reason: String },
 }
 
+/// Decision returned by the `turn_end_gate` hook.
+///
+/// `Inject` carries a followup message that jcode queues as the next turn's
+/// user instruction, letting an external orchestrator (e.g. babysitter) drive
+/// continuation after each turn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TurnEndGateDecision {
+    Continue,
+    Inject { followup_message: String },
+}
+
 /// A lifecycle event to deliver to a hook.
 #[derive(Debug, Clone)]
 pub struct HookEvent {
@@ -103,6 +114,7 @@ pub fn hook_commands(event: &str) -> Vec<String> {
     let raw = match event {
         "turn_start" => hooks.turn_start.as_ref(),
         "turn_end" => hooks.turn_end.as_ref(),
+        "turn_end_gate" => hooks.turn_end_gate.as_ref(),
         "session_start" => hooks.session_start.as_ref(),
         "session_end" => hooks.session_end.as_ref(),
         "pre_tool" => hooks.pre_tool.as_ref(),
@@ -375,6 +387,140 @@ async fn run_pre_tool_command(
     }
 }
 
+/// Max characters of a followup message injected from the turn_end gate.
+const FOLLOWUP_MESSAGE_LIMIT: usize = 8000;
+
+/// Run the `turn_end_gate` hook after a turn, if configured.
+///
+/// The hook receives the same env/payload fields as the `turn_end` observer
+/// (STATUS, DURATION_MS, MODEL, LAST_ASSISTANT_TEXT). Contract:
+///
+/// - stdout parses as JSON `{"decision":"block","followup_message":"<text>"}`
+///   => `Inject { followup_message }`; jcode queues it as the next turn's user
+///   instruction.
+/// - exit 0, empty stdout, malformed JSON, exit 2, timeout, or spawn failure
+///   => `Continue` (no injection; observer semantics preserved).
+pub async fn run_turn_end_gate(
+    session_id: &str,
+    working_dir: Option<&str>,
+    status: &str,
+    duration_ms: &str,
+    last_assistant_text: Option<&str>,
+) -> TurnEndGateDecision {
+    let Some(command_line) = hook_command("turn_end_gate") else {
+        return TurnEndGateDecision::Continue;
+    };
+
+    let mut event = HookEvent::new("turn_end_gate")
+        .session_id(session_id)
+        .field("STATUS", status.to_string())
+        .field("DURATION_MS", duration_ms.to_string());
+    if let Some(cwd) = working_dir {
+        event = event.cwd(cwd);
+    }
+    if let Some(text) = last_assistant_text {
+        event = event.field("LAST_ASSISTANT_TEXT", truncate_bytes(text, 4000).to_string());
+    }
+
+    let std_cmd = match build_hook_process(&command_line, &event) {
+        Ok(cmd) => cmd,
+        Err(error) => {
+            crate::logging::warn(&format!(
+                "Hook 'turn_end_gate' command '{command_line}' is invalid: {error} (continuing)"
+            ));
+            return TurnEndGateDecision::Continue;
+        }
+    };
+
+    let mut cmd = tokio::process::Command::from(std_cmd);
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+
+    let child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            crate::logging::warn(&format!(
+                "Hook 'turn_end_gate' command '{command_line}' failed to start: {error} (continuing)"
+            ));
+            return TurnEndGateDecision::Continue;
+        }
+    };
+
+    let timeout = std::time::Duration::from_millis(
+        crate::config::config().hooks.turn_end_gate_timeout_ms.max(1),
+    );
+    let output = match tokio::time::timeout(timeout, child.wait_with_output()).await {
+        Ok(Ok(output)) => output,
+        Ok(Err(error)) => {
+            crate::logging::warn(&format!(
+                "Hook 'turn_end_gate' command '{command_line}' failed: {error} (continuing)"
+            ));
+            return TurnEndGateDecision::Continue;
+        }
+        Err(_elapsed) => {
+            crate::logging::warn(&format!(
+                "Hook 'turn_end_gate' command '{command_line}' timed out after {}ms (continuing)",
+                timeout.as_millis()
+            ));
+            return TurnEndGateDecision::Continue;
+        }
+    };
+
+    if output.status.code() != Some(0) {
+        crate::logging::warn(&format!(
+            "Hook 'turn_end_gate' command '{command_line}' exited with {:?} (expected 0; continuing)",
+            output.status.code()
+        ));
+        return TurnEndGateDecision::Continue;
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let followup = parse_turn_end_followup(&stdout);
+    match &followup {
+        TurnEndGateDecision::Inject { followup_message } => crate::logging::info(&format!(
+            "Hook 'turn_end_gate' requested continuation for session {session_id} ({})",
+            followup_message.chars().count()
+        )),
+        TurnEndGateDecision::Continue => crate::logging::debug(&format!(
+            "Hook 'turn_end_gate' produced no followup for session {session_id}"
+        )),
+    }
+    followup
+}
+
+/// Parse a turn-end gate stdout blob for a block decision with a followup
+/// message. Returns `Inject` only when the JSON is well-formed and the
+/// followup message is non-empty.
+fn parse_turn_end_followup(stdout: &str) -> TurnEndGateDecision {
+    let trimmed = stdout.trim();
+    if trimmed.is_empty() {
+        return TurnEndGateDecision::Continue;
+    }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+        crate::logging::warn(&format!(
+            "Hook 'turn_end_gate' stdout is not valid JSON (continuing): {trimmed}"
+        ));
+        return TurnEndGateDecision::Continue;
+    };
+    if value.get("decision").and_then(|d| d.as_str()) != Some("block") {
+        return TurnEndGateDecision::Continue;
+    }
+    let message = value
+        .get("followup_message")
+        .and_then(|m| m.as_str())
+        .unwrap_or("")
+        .trim();
+    if message.is_empty() {
+        return TurnEndGateDecision::Continue;
+    }
+    let message: String = message.chars().take(FOLLOWUP_MESSAGE_LIMIT).collect();
+    TurnEndGateDecision::Inject {
+        followup_message: message,
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::await_holding_lock)]
 mod tests {
@@ -402,6 +548,67 @@ mod tests {
         assert!(truncated.len() <= 3);
         assert!(text.starts_with(truncated));
         assert_eq!(truncate_bytes("short", 100), "short");
+    }
+
+    #[test]
+    fn parse_turn_end_followup_injects_on_block_decision() {
+        let decision = parse_turn_end_followup(
+            "{\"decision\":\"block\",\"followup_message\":\"continue the run\"}",
+        );
+        assert_eq!(
+            decision,
+            TurnEndGateDecision::Inject {
+                followup_message: "continue the run".to_string()
+            }
+        );
+
+        let whitespace = parse_turn_end_followup("  {\"decision\":\"block\",\"followup_message\":\"go\"}  ");
+        assert_eq!(
+            whitespace,
+            TurnEndGateDecision::Inject {
+                followup_message: "go".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn parse_turn_end_followup_continues_without_block_decision() {
+        assert_eq!(parse_turn_end_followup(""), TurnEndGateDecision::Continue);
+        assert_eq!(parse_turn_end_followup("   "), TurnEndGateDecision::Continue);
+        assert_eq!(
+            parse_turn_end_followup("{\"decision\":\"allow\"}"),
+            TurnEndGateDecision::Continue
+        );
+        assert_eq!(
+            parse_turn_end_followup("{\"decision\":\"block\"}"),
+            TurnEndGateDecision::Continue
+        );
+        assert_eq!(
+            parse_turn_end_followup("{\"decision\":\"block\",\"followup_message\":\"\"}"),
+            TurnEndGateDecision::Continue
+        );
+        assert_eq!(
+            parse_turn_end_followup("not json at all"),
+            TurnEndGateDecision::Continue
+        );
+        assert_eq!(
+            parse_turn_end_followup("{\"decision\":\"block\",\"followup_message\":\"   \"}"),
+            TurnEndGateDecision::Continue
+        );
+    }
+
+    #[test]
+    fn parse_turn_end_followup_truncates_long_messages() {
+        let long = "x".repeat(20_000);
+        let decision = parse_turn_end_followup(&format!(
+            "{{\"decision\":\"block\",\"followup_message\":\"{long}\"}}"
+        ));
+        match decision {
+            TurnEndGateDecision::Inject { followup_message } => {
+                assert!(followup_message.chars().count() <= FOLLOWUP_MESSAGE_LIMIT);
+            }
+            TurnEndGateDecision::Continue => panic!("expected Inject for long message"),
+        }
     }
 
     #[cfg(unix)]

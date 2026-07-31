@@ -838,6 +838,19 @@ pub struct HooksConfig {
     /// Fields: STATUS ("ok"/"error"), DURATION_MS, MODEL, LAST_ASSISTANT_TEXT.
     /// Env override: JCODE_HOOK_TURN_END.
     pub turn_end: Option<HookCommands>,
+    /// Gate hook after each turn completes. Unlike `turn_end` (observer), jcode
+    /// waits for this hook. If its stdout is valid JSON of the form
+    /// `{"decision":"block","followup_message":"<text>"}`, the followup message
+    /// is injected as the next turn's user instruction (continuation, e.g. for
+    /// external orchestrators like babysitter). Exit 0, no stdout, malformed
+    /// JSON, or exit 2 all mean "no injection" and observer behavior is
+    /// preserved. Fields: STATUS, DURATION_MS, MODEL, LAST_ASSISTANT_TEXT.
+    /// Env override: JCODE_HOOK_TURN_END_GATE.
+    pub turn_end_gate: Option<HookCommands>,
+    /// Max milliseconds to wait for the turn_end gate before continuing
+    /// without injection (default: 5000). Env override:
+    /// JCODE_HOOK_TURN_END_GATE_TIMEOUT_MS.
+    pub turn_end_gate_timeout_ms: u64,
     /// Runs when a session becomes active (created or resumed).
     /// Fields: SOURCE ("create"/"resume").
     /// Env override: JCODE_HOOK_SESSION_START.
@@ -864,6 +877,8 @@ impl Default for HooksConfig {
         Self {
             turn_start: None,
             turn_end: None,
+            turn_end_gate: None,
+            turn_end_gate_timeout_ms: 5000,
             session_start: None,
             session_end: None,
             pre_tool: None,

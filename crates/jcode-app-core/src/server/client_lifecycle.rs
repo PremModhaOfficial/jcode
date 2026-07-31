@@ -3275,9 +3275,30 @@ pub(super) async fn process_message_streaming_mpsc(
 ) -> Result<()> {
     let mut agent = agent.lock().await;
     let session_id = agent.session_id().to_string();
-    let result = agent
-        .run_once_streaming_mpsc(content, images, system_reminder, event_tx)
+    let mut result = agent
+        .run_once_streaming_mpsc(content, images, system_reminder, event_tx.clone())
         .await;
+
+    // Continue while the turn_end_gate hook requests a followup (external
+    // orchestrator continuation). Bounded so a misbehaving hook cannot loop
+    // forever; each followup is injected as the next turn's user message.
+    let mut followup_turns = 0;
+    const MAX_FOLLOWUP_TURNS: usize = 1000;
+    while result.is_ok() && followup_turns < MAX_FOLLOWUP_TURNS {
+        let Some(followup) = agent.take_pending_followup() else {
+            break;
+        };
+        followup_turns += 1;
+        result = agent
+            .run_once_streaming_mpsc(&followup, Vec::new(), None, event_tx.clone())
+            .await;
+    }
+    if followup_turns >= MAX_FOLLOWUP_TURNS {
+        crate::logging::warn(&format!(
+            "Turn-end gate followup loop exceeded {MAX_FOLLOWUP_TURNS} turns for session {session_id}; stopping continuation"
+        ));
+    }
+
     if result.is_ok() {
         crate::runtime_memory_log::emit_event(
             crate::runtime_memory_log::RuntimeMemoryLogEvent::new(

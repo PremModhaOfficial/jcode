@@ -97,7 +97,7 @@ impl Agent {
         self.fire_turn_start_hook("chat");
         let result = self.run_turn_streaming_mpsc(event_tx).await;
         self.current_turn_system_reminder = None;
-        self.fire_turn_end_hook(&result, turn_started_at, start_message_index);
+        self.fire_turn_end_hook(&result, turn_started_at, start_message_index).await;
         result
     }
 
@@ -156,37 +156,62 @@ impl Agent {
         crate::hooks::dispatch_observer(event);
     }
 
-    /// Fire the `turn_end` observer hook with turn outcome metadata.
-    /// No-op (without building the payload) when the hook is not configured.
-    fn fire_turn_end_hook(
-        &self,
+    /// Fire the `turn_end` observer hook with turn outcome metadata, then run
+    /// the optional `turn_end_gate` hook. When the gate requests continuation
+    /// (`{"decision":"block","followup_message":...}` on stdout), the followup
+    /// is queued on the agent for injection as the next turn's instruction.
+    /// No-ops (without building the payload) when neither hook is configured.
+    async fn fire_turn_end_hook(
+        &mut self,
         result: &Result<()>,
         started_at: Instant,
         start_message_index: usize,
     ) {
-        if !crate::hooks::hook_configured("turn_end") {
-            return;
-        }
         let status = if result.is_ok() { "ok" } else { "error" };
-        let mut event = crate::hooks::HookEvent::new("turn_end")
-            .session_id(self.session.id.clone())
-            .field("STATUS", status)
-            .field("DURATION_MS", started_at.elapsed().as_millis().to_string())
-            .field("MODEL", self.provider_model());
-        if let Some(cwd) = self.working_dir() {
-            event = event.cwd(cwd);
+        let duration_ms = started_at.elapsed().as_millis().to_string();
+        let last_assistant_text = self.latest_assistant_text_after(start_message_index);
+
+        if crate::hooks::hook_configured("turn_end") {
+            let mut event = crate::hooks::HookEvent::new("turn_end")
+                .session_id(self.session.id.clone())
+                .field("STATUS", status)
+                .field("DURATION_MS", duration_ms.clone())
+                .field("MODEL", self.provider_model());
+            if let Some(cwd) = self.working_dir() {
+                event = event.cwd(cwd);
+            }
+            if let Some(text) = &last_assistant_text {
+                const LAST_TEXT_LIMIT: usize = 4000;
+                let snippet: String = text.chars().take(LAST_TEXT_LIMIT).collect();
+                event = event.field("LAST_ASSISTANT_TEXT", snippet);
+            }
+            if let Err(error) = result {
+                const ERROR_LIMIT: usize = 1000;
+                let message: String = error.to_string().chars().take(ERROR_LIMIT).collect();
+                event = event.field("ERROR", message);
+            }
+            crate::hooks::dispatch_observer(event);
         }
-        if let Some(text) = self.latest_assistant_text_after(start_message_index) {
-            const LAST_TEXT_LIMIT: usize = 4000;
-            let snippet: String = text.chars().take(LAST_TEXT_LIMIT).collect();
-            event = event.field("LAST_ASSISTANT_TEXT", snippet);
+
+        // The turn_end gate is opt-in and separate from the observer. Only run
+        // it after a successful turn; a failed turn has no next step to drive.
+        if result.is_ok() && crate::hooks::hook_configured("turn_end_gate") {
+            let decision = crate::hooks::run_turn_end_gate(
+                &self.session.id,
+                self.working_dir(),
+                status,
+                &duration_ms,
+                last_assistant_text.as_deref(),
+            )
+            .await;
+            if let crate::hooks::TurnEndGateDecision::Inject { followup_message } = decision {
+                crate::logging::info(&format!(
+                    "Queuing turn_end_gate followup for session {}",
+                    self.session.id
+                ));
+                self.pending_followup = Some(followup_message);
+            }
         }
-        if let Err(error) = result {
-            const ERROR_LIMIT: usize = 1000;
-            let message: String = error.to_string().chars().take(ERROR_LIMIT).collect();
-            event = event.field("ERROR", message);
-        }
-        crate::hooks::dispatch_observer(event);
     }
 
     /// Clear conversation history

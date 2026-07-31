@@ -117,6 +117,12 @@ impl Agent {
         std::mem::take(&mut self.pending_alerts)
     }
 
+    /// Take the followup message queued by the `turn_end_gate` hook, if any.
+    /// Clears the slot. The caller injects it as the next turn's user message.
+    pub fn take_pending_followup(&mut self) -> Option<String> {
+        self.pending_followup.take()
+    }
+
     /// Queue a soft interrupt message to be injected at the next safe point.
     /// This method can be called even while the agent is processing (uses separate lock).
     pub fn queue_soft_interrupt(
