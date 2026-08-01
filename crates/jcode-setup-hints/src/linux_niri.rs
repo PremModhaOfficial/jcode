@@ -324,6 +324,19 @@ fn find_managed_region(config: &str) -> (Option<usize>, Option<usize>) {
     (Some(line_start), Some(line_end))
 }
 
+/// Remove a legacy inline managed block (between the sentinels) from `config`,
+/// returning the text with that region deleted. Used to clean up old versions
+/// that spliced the block into the wrong `binds { }` block.
+pub(crate) fn strip_managed_block(config: &str) -> String {
+    if let (Some(begin_idx), Some(end_line_end)) = find_managed_region(config) {
+        let mut out = String::with_capacity(config.len());
+        out.push_str(&config[..begin_idx]);
+        out.push_str(&config[end_line_end..]);
+        return out;
+    }
+    config.to_string()
+}
+
 /// Byte offset just after the first `binds {` opening line's newline, i.e. the
 /// point to insert new binds so they land inside the block. Returns `None` if no
 /// `binds {` block exists.
